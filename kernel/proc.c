@@ -419,7 +419,7 @@ proc_vmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     pte_t *pte = walk_pgtable(old, i, 0);
 
     if (pte == 0 || (*pte & PTE_V) == 0) {
-      return -1;
+      continue;
     }
 
     uint64 pa = PTE2PA(*pte);
@@ -427,6 +427,9 @@ proc_vmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if(pa == 0) {
       return -1;
     }
+
+    // preserve original flags
+    int flags = PTE_FLAGS(*pte);
 
     void *mem = vm_page_alloc();
 
@@ -436,7 +439,8 @@ proc_vmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
     memmove(mem, (void*)pa, PGSIZE);
 
-    if(vm_page_insert(new, i, (uint64)mem, PTE_R | PTE_W | PTE_U) < 0) {
+    if(vm_page_insert(new, i, (uint64)mem, flags) < 0) {
+      vm_page_free(mem);
       return -1;
     }
   }
