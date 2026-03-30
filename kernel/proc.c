@@ -70,7 +70,7 @@ proc_init(void)
     }
 
     // map into kernel page table
-    vm_page_insert(kernel_pagetable, (uint64)pa, p->kstack, PTE_R | PTE_W);
+    vm_page_insert(kernel_pagetable, p->kstack, (uint64)pa, PTE_R | PTE_W);
   }
 
 }
@@ -80,7 +80,7 @@ proc_init(void)
 // Set up the first user process. Return the process it was allocated to.
 struct proc*
 proc_load_user_init(void)
-{
+{   
     void *bin = &_binary_user_init_start;
     struct proc *p = 0x00;
 
@@ -91,15 +91,21 @@ proc_load_user_init(void)
     // contains the program image for init.
     // YOUR CODE HERE
 
-    struct proc *p = proc_alloc();
+    //struct proc *p = proc_alloc();
+
+
+
+    p = proc_alloc();
 
     if (p == 0) {
       panic("init alloc failed");
     }
 
-    if (proc_load_elf(p, &_binary_user_init_start) < 0) {
+    if (proc_load_elf(p, bin) < 0) {
       panic("init load failed");
     }
+
+    p->state = RUNNABLE;
 
     return p;
 }
@@ -246,23 +252,15 @@ proc_load_elf(struct proc *p, void *bin)
     //       exec works in xv6. Happy reading!
     // YOUR CODE HERE
 
-    struct elfhdr elf = *(struct elfhdr*)bin;
-    struct proghdr ph;
-    pagetable_t pagetable = 0;
-    uint64 sz = 0;
-
-    if (elf.magic != ELF_MAGIC) {
-        goto bad;
-    }
 
     pagetable = proc_pagetable(p);
     if (pagetable == 0)
         goto bad;
 
     // loop program headers
-    for (int i = 0; i < elf.phnum; i++) {
+    for (i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
 
-      ph = *(struct proghdr*)((char*)bin + elf.phoff + i*sizeof(ph));
+      ph = *(struct proghdr*)((char*)bin + off);
 
       if (ph.type != ELF_PROG_LOAD) {
         continue;
@@ -272,32 +270,65 @@ proc_load_elf(struct proc *p, void *bin)
         goto bad;
       }
 
+      //if (ph.memsz < ph.filesz || (ph.vaddr + ph.memsz < ph.vaddr)) {
+      //  goto bad;
+      //}
+
       if (ph.vaddr + ph.memsz < ph.vaddr) {
         goto bad;
       }
 
-      uint64 newsz = proc_resize(pagetable, sz, ph.vaddr + ph.memsz);
-      if (newsz == 0) {
-        goto bad;
+      // build correct permissions from ELF flags
+      int perm = PTE_R | PTE_U;
+      if (ph.flags & 0x1) perm |= PTE_X;
+      if (ph.flags & 0x2) perm |= PTE_W;
+
+      // manually allocate pages with right permissions
+      uint64 a = PGROUNDUP(sz);
+      uint64 end = ph.vaddr + ph.memsz;
+      for (; a < end; a += PGSIZE) {
+        void *mem = vm_page_alloc();
+        if (mem == 0) {
+          goto bad;
+        }
+        memset(mem, 0, PGSIZE);
+        if (vm_page_insert(pagetable, a, (uint64)mem, perm) < 0) {
+          vm_page_free(mem);
+          goto bad;
+        }
       }
 
-      sz = newsz;
+      //uint64 newsz = proc_resize(pagetable, sz, ph.vaddr + ph.memsz);
+      //if (newsz == 0) {
+      ///  goto bad;
+      //}
+
+      //sz = newsz;
+
+      sz = end;
 
       if (proc_loadseg(pagetable, ph.vaddr, bin, ph.off, ph.filesz) < 0) {
         goto bad;
       }
+
     }
 
     // stack
     sz = PGROUNDUP(sz);
-    sz = proc_resize(pagetable, sz, sz + 2*PGSIZE);
+  
+    sz = proc_resize(pagetable, sz, sz + 2 * PGSIZE);
+    if (sz == 0) {
+      goto bad;
+    }
 
-    proc_guard(pagetable, sz - 2*PGSIZE);
-
-    uint64 sp = sz;
+   
+    proc_guard(pagetable, sz - 2 * PGSIZE);
+    sp = sz;
 
     // commit
-    proc_free_pagetable(p->pagetable, p->sz);
+    if (p->pagetable) {
+      proc_free_pagetable(p->pagetable, p->sz);  // old page table then new page table
+    }
 
     p->pagetable = pagetable;
     p->sz = sz;
@@ -313,12 +344,11 @@ bad:
     // YOUR CODE HERE
 
     if(pagetable) {
-        proc_free_pagetable(pagetable, sz);
+        proc_free_pagetable(pagetable, 0);
     }
 
     return -1;
 
-    //return -1;
 }
 
 
@@ -341,22 +371,27 @@ uint64 proc_resize(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
     for (; a < newsz; a += PGSIZE) {
       void *mem = vm_page_alloc();
       if (mem == 0) {
+        proc_shrink(pagetable, a, oldsz);
         return 0;
       }
 
       memset(mem, 0, PGSIZE);
 
-      if (vm_page_insert(pagetable, (uint64)mem, a, PTE_R | PTE_W | PTE_U) < 0) {
+      if (vm_page_insert(pagetable, a, (uint64)mem, PTE_R | PTE_W | PTE_U) < 0) {
+        vm_page_free(mem);
+        proc_shrink(pagetable, a, oldsz);
         return 0;
       }
     }
 
     return newsz;
 
+  } else if (newsz < oldsz) {
+      return proc_shrink(pagetable, oldsz, newsz);
   }
 
-  return proc_shrink(pagetable, oldsz, newsz);
-
+  return newsz;
+  //return oldsz;
   // return 0; 
 }
 
@@ -381,7 +416,14 @@ proc_vmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for (uint64 i = 0; i < sz; i += PGSIZE) {
 
-    uint64 pa = walkaddr(old, i);
+    pte_t *pte = walk_pgtable(old, i, 0);
+
+    if (pte == 0 || (*pte & PTE_V) == 0) {
+      return -1;
+    }
+
+    uint64 pa = PTE2PA(*pte);
+
     if(pa == 0) {
       return -1;
     }
@@ -394,7 +436,7 @@ proc_vmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
     memmove(mem, (void*)pa, PGSIZE);
 
-    if(vm_page_insert(new, (uint64)mem, i, PTE_R | PTE_W | PTE_U) < 0) {
+    if(vm_page_insert(new, i, (uint64)mem, PTE_R | PTE_W | PTE_U) < 0) {
       return -1;
     }
   }
@@ -434,12 +476,12 @@ proc_pagetable(struct proc *p)
   }
 
   // trampoline
-  if (vm_page_insert(pagetable, (uint64)trampoline, TRAMPOLINE, PTE_R | PTE_X) < 0) {
+  if (vm_page_insert(pagetable, TRAMPOLINE, (uint64)trampoline, PTE_R | PTE_X) < 0) {
     return 0;
   }
 
   // trapframe
-  if (vm_page_insert(pagetable, (uint64)p->trapframe, TRAPFRAME, PTE_R | PTE_W) < 0) {
+  if (vm_page_insert(pagetable, TRAPFRAME, (uint64)p->trapframe, PTE_R | PTE_W) < 0) {
     return 0; 
   }
 
@@ -533,19 +575,21 @@ proc_loadseg(pagetable_t pagetable, uint64 va, void *bin, uint offset, uint sz)
   // YOUR CODE HERE
 
   for (i = 0; i < sz; i += PGSIZE) {
-    pa = walkaddr(pagetable, va + i);
-    if (pa == 0) {
+
+    pte_t *pte = walk_pgtable(pagetable, va + i, 0);
+    if (pte == 0 || (*pte & PTE_V) == 0) {
       return -1;
     }
+
+    pa = PTE2PA(*pte);
 
     n = (sz - i < PGSIZE) ? sz - i : PGSIZE;
 
     memmove((void*)pa, (char*)bin + offset + i, n);
-
-  }
+  } 
 
   return 0;
-  // return -1;
+
 }
 
 
